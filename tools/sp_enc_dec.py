@@ -1,15 +1,25 @@
 import sentencepiece as spm
-import sys, getopt 
+import sys, getopt
+import shutil 
+from onmt.utils.logging import logger
+import os
 
 
 def train_spm(input_file,prefix,vocab_size,model_type):  
     try:
-        spm.SentencePieceTrainer.Train('--input={} --model_prefix={} --vocab_size={} --model_type={}'.format(input_file,prefix,vocab_size,model_type))
+        user_defined_symbol = 'UuRrLl,DdAaTtEe,NnUuMm'
+        spm.SentencePieceTrainer.Train('--input={} --model_prefix={} --vocab_size={} --model_type={} --user_defined_symbols={}'.format(input_file,prefix,vocab_size,model_type,user_defined_symbol))
+        os.system('cp {} {}'.format(prefix+'.model','model/sentencepiece_models/'))
+        os.system('cp {} {}'.format(prefix+'.vocab','model/sentencepiece_models/'))
+        # shutil.copy("{}".format(prefix+'.model'), "model/sentencepiece_models/{}".format(prefix+'.model'))
+        # shutil.copy("{}".format(prefix+'.vocab'), "model/sentencepiece_models/{}".format(prefix+'.vocab'))
+        os.system('rm -f {0} {1}'.format(prefix+'.model',prefix+'.vocab'))
+        print("sp models successfully transfered and removed")
         return
-    except:
-        print("something went wrong!")
+    except Exception as e:
+        print("something went wrong!: ",e)
         print("Unexpected error:", sys.exc_info()[0])
-        return
+        raise
 
 def encode_as_pieces(load_model,src_file,tgt_file):
     # makes segmenter instance and loads the model file (m.model)
@@ -24,22 +34,22 @@ def encode_as_pieces(load_model,src_file,tgt_file):
                     encLine = sp.encode_as_pieces(xlines[i])
                     outfile.write(str(encLine))
                     outfile.write("\n")
-    except:
-        print("something went wrong!")
+    except Exception as e:
+        print("something went wrong!: ",e)
         print("Unexpected error:", sys.exc_info()[0])
-        return
+        raise
 
 def encode_line(load_model,line):
     # makes segmenter instance and loads the model file (m.model)
     try:
         sp = spm.SentencePieceProcessor()
         sp.load(load_model)
-        print("here, encoding line using sp")
+        logger.info("encoding using sp model {}".format(load_model))
         return sp.encode_as_pieces(line)
     except:
-        print("something went wrong!")
-        print("Unexpected error:", sys.exc_info()[0])
-        return
+        logger.info("something went wrong!")
+        logger.info("Unexpected error: %s"% sys.exc_info()[0])
+        return ""
     
 
 def decode_as_pieces(load_model,src_file,tgt_file):
@@ -52,6 +62,9 @@ def decode_as_pieces(load_model,src_file,tgt_file):
                 xlines= xh.readlines()
         
                 for i in range(len(xlines)):
+                    xlines[i] = xlines[i][0]+xlines[i][1:-1].replace('[',"")+xlines[i][-1] 
+                    xlines[i] = xlines[i][0]+xlines[i][1:-1].replace(']',"")+xlines[i][-1] 
+
                     if not xlines[i].startswith("["):
                         print("here1")
                         xlines[i] = "["+xlines[i].rstrip()
@@ -60,12 +73,13 @@ def decode_as_pieces(load_model,src_file,tgt_file):
                         print("here2")
                         print(xlines[i])
                         xlines[i] = xlines[i].rstrip()+"]" 
-                        print(xlines[i])         
+                        print(xlines[i])
+                                 
                     encLine = spH.DecodePieces(eval(xlines[i]))
                     outfile.write(str(encLine))
                     outfile.write("\n")
-    except:
-        print("something went wrong!")
+    except Exception as e:
+        print("something went wrong!: ",e)
         print("Unexpected error:", sys.exc_info()[0])
         return                    
 
@@ -75,11 +89,20 @@ def decode_line(load_model,line):
     try:
         sp = spm.SentencePieceProcessor()
         sp.load(load_model)
+        if not line.startswith("["):
+            line = "["+line
+        if not line.endswith("]"):
+            line = line+"]"     
+        line = line[0]+line[1:-1].replace('[',"")+line[-1] 
+        line = line[0]+line[1:-1].replace(']',"")+line[-1]  
+        logger.info("decoding using sp model {}".format(load_model))
+        if "<unk>" in line:
+            line = line.replace("<unk>","'<unk>'")
         return sp.DecodePieces(eval(line))
-    except:
-        print("something went wrong!")
-        print("Unexpected error:", sys.exc_info()[0])
-        return
+    except Exception as e:
+        logger.error("something went wrong! {}".format(e))
+        logger.error("Unexpected error: %s"% sys.exc_info()[0])
+        return ""
 
   
 if __name__ == '__main__':

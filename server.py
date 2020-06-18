@@ -3,9 +3,11 @@ from __future__ import unicode_literals
 import configargparse
 import sys
 from config.config import statusCode,benchmark_types, language_supported, file_location
-import bleu_results as bleu_results
-import anuvada
+import config.bleu_results as bleu_results
 import tools.sp_enc_dec as sp
+import ancillary_functions_anuvaad.ancillary_functions as ancillary_functions
+import ancillary_functions_anuvaad.sc_preface_handler as sc_preface_handler
+import ancillary_functions_anuvaad.handle_date_url as date_url_util
 
 from flask import Flask, jsonify, request,send_file,abort,send_from_directory
 from flask_cors import CORS
@@ -19,19 +21,22 @@ from onmt.translate.translator import build_translator
 import os
 import onmt.opts as opts
 from onmt.utils.parse import ArgumentParser
-from mongo_model import db,Benchmarks
+from config.mongo_model import db,Benchmarks
 import datetime
+from kafka_utils.document_translator import doc_translator
+import threading
+import translation_util.translate_util as translate_util
+import translation_util.interactive_translate as interactive_translation
+from config.kafka_topics import consumer_topics,producer_topics,kafka_topic
 
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
 
-API_FILE_DIRECTORY = "src_tgt_api_files/"
 mongo_config_dir = "config/mongo_config.py"
+IS_RUN_KAFKA = 'IS_RUN_KAFKA'
+IS_RUN_KAFKA_DEFAULT_VALUE = False
+bootstrap_server_boolean = os.environ.get(IS_RUN_KAFKA, IS_RUN_KAFKA_DEFAULT_VALUE)
 
-if not os.path.exists(API_FILE_DIRECTORY):
-    os.makedirs(os.path.join(API_FILE_DIRECTORY,'source_files/'))
-    os.makedirs(os.path.join(API_FILE_DIRECTORY,'target_files/'))
-    os.makedirs(os.path.join(API_FILE_DIRECTORY,'target_ref_files/'))
 
 def start(config_file,
           url_root="/translator",
@@ -50,6 +55,14 @@ def start(config_file,
     app.route = prefix_route(app.route, url_root)
     translation_server = TranslationServer()
     translation_server.start(config_file)
+
+    def kafka_function():
+        logger.info('starting kafka from nmt-server on thread-1')
+        doc_translator(translation_server,[kafka_topic[0]['consumer'],kafka_topic[1]['consumer'],kafka_topic[2]['consumer']])     
+
+    if bootstrap_server_boolean:
+        t1 = threading.Thread(target=kafka_function)
+        t1.start()
 
     @app.route('/models', methods=['GET'])
     def get_models():
@@ -98,127 +111,59 @@ def start(config_file,
 
         return jsonify(out)
 
-    @app.route('/translate', methods=['POST'])
+    @app.route('/translate-anuvaad', methods=['POST'])
     def translate():
-        ## not using
         inputs = request.get_json(force=True)
-        out = {}
-        try:
-            translation, scores, n_best, times = translation_server.run(inputs)
-            assert len(translation) == len(inputs)
-            assert len(scores) == len(inputs)
-
-            out = [[{"src": inputs[i]['src'], "tgt": translation[i],
-                     "n_best": n_best,
-                     "pred_score": scores[i]}
-                    for i in range(len(translation))]]
-        except ServerModelError as e:
-            out['error'] = str(e)
-            out['status'] = STATUS_ERROR
-
-        return jsonify(out)
+        if len(inputs)>0:
+            logger.info("Making translate-anuvaad API call")
+            out = translate_util.translate_func(inputs, translation_server)
+            logger.info("out from translate_func-trans_util done{}".format(out))
+            return jsonify(out)
+        else:
+            logger.info("null inputs in request in translate-anuvaad API")
+            return jsonify({'status':statusCode["INVALID_API_REQUEST"]})
+            
+    @app.route('/interactive-translation', methods=['POST'])
+    def interactive_translate():
+        "not using this for now"
+        inputs = request.get_json(force=True)
+        if len(inputs)>0:
+            logger.info("Making interactive-translation API call")
+            print(inputs)
+            out = interactive_translation.interactive_translation(inputs)
+            logger.info("out from interactive-translation done{}".format(out))
+            return jsonify(out)
+        else:
+            logger.info("null inputs in request in interactive-translation API")
+            return jsonify({'status':statusCode["INVALID_API_REQUEST"]})                    
 
     @app.route('/translation_en', methods=['POST'])
     def translation_en():
         inputs = request.get_json(force=True)
-        out = {}
-        tgt = list()
-        pred_score = list()
-        try:
-            for i in inputs:
-                if  any(v not in i for v in ['src','id']):
-                    out['status'] = statusCode["ID_OR_SRC_MISSING"]
-                    return jsonify(out)
-
-                i['src'] = anuvada.moses_tokenizer(i['src'])
-                # i['src'] = anuvada.truecaser(i['src'])   
-                if i['id'] == 1:                   
-                    i['src'] = str(sp.encode_line('en-220519.model',i['src']))
-                    translation, scores, n_best, times = translation_server.run([i])
-                    translation = sp.decode_line('hi-220519.model',translation[0])
-                    translation = anuvada.indic_detokenizer(translation)
-                elif i['id'] == 7:                   
-                    i['src'] = str(sp.encode_line('enT-08072019-10k.model',i['src']))
-                    translation, scores, n_best, times = translation_server.run([i])
-                    translation = sp.decode_line('ta-08072019-10k.model',translation[0])     
-                else:
-                    out['status'] = statusCode["INCORRECT_ID"]
-                    return jsonify(out)
-                
-                tgt.append(translation)
-                pred_score.append(scores[0])
-
-            out['status'] = statusCode["SUCCESS"]
-            out['response_body'] = [{"tgt": tgt[i],
-                     "pred_score": pred_score[i]}
-                    for i in range(len(tgt))]
-        except ServerModelError as e:
-            out['status'] = statusCode["SEVER_MODEL_ERR"]
-            out['status']['errObj'] = str(e)
-        except:
-            out['status'] = statusCode["SYSTEM_ERR"]
-            logger.info("Unexpected error: %s"% sys.exc_info()[0])    
-
-        return jsonify(out)        
+        if len(inputs)>0:
+            logger.info("Making translation_en API call")
+            out = translate_util.from_en(inputs, translation_server)
+            logger.info("out from english-trans_util done{}".format(out))
+            return jsonify(out)  
+        else:
+            logger.info("null inputs in request in translation_en API")
+            return jsonify({'status':statusCode["INVALID_API_REQUEST"]})       
 
     @app.route('/translation_hi', methods=['POST'])
     def translation_hi():
         inputs = request.get_json(force=True)
-        out = {}
-        tgt = list()
-        pred_score = list()
-        try:
-            for i in inputs:
-                if  any(v not in i for v in ['src','id']):
-                    out['status'] = statusCode["ID_OR_SRC_MISSING"]
-                    return jsonify(out) 
-                if i['id'] == 3:
-                    logger.info("translating using the first model")
-                    translation, scores, n_best, times = translation_server.run([i])
-                    translation = translation[0]   
-
-                else:
-                    i['src'] = anuvada.indic_tokenizer(i['src']) 
-
-                    if i['id'] == 2:
-                        i['src'] = str(sp.encode_line('hi-220519.model',i['src']))
-                        translation, scores, n_best, times = translation_server.run([i])
-                        translation = sp.decode_line('en-220519.model',translation[0])
-                    elif i['id'] in [5,6]:
-                        i['src'] = str(sp.encode_line('hi-28062019-10k.model',i['src']))
-                        translation, scores, n_best, times = translation_server.run([i])
-                        translation = sp.decode_line('en-28062019-10k.model',translation[0])
-                    elif i['id'] == 4:
-                        i['src'] = anuvada.apply_bpe('codesSrc1005.bpe',i['src'])
-                        translation, scores, n_best, times = translation_server.run([i])
-                        translation = anuvada.decode_bpe(translation[0])
-                    else:
-                        out['status'] = statusCode["INCORRECT_ID"]
-                        return jsonify(out)      
-                    translation = anuvada.moses_detokenizer(translation)
-                    translation = anuvada.detruecaser(translation)
-                
-                tgt.append(translation)
-                pred_score.append(scores[0])
-
-            out['status'] = statusCode["SUCCESS"]
-            out['response_body'] = [{"tgt": tgt[i],
-                     "pred_score": pred_score[i]}
-                    for i in range(len(tgt))]
-        except ServerModelError as e:
-            out['status'] = statusCode["SEVER_MODEL_ERR"]
-            out['status']['errObj'] = str(e)
-        except Exception as e:
-            out['status'] = statusCode["SYSTEM_ERR"]
-            out['status']['errObj'] = str(e)
-            logger.info("Unexpected error: %s"% sys.exc_info()[0])   
-
-        return jsonify(out)
+        if len(inputs)>0:
+            logger.info("Making translation_hi API call")
+            out = translate_util.from_hindi(inputs, translation_server)
+            logger.info("out from hindi-trans_util done{}".format(out))
+            return jsonify(out)
+        else:
+            logger.info("null inputs in request in translation_hi API")
+            return jsonify({'status':statusCode["INVALID_API_REQUEST"]})  
 
     @app.route('/save_benchmark', methods=['POST'])
     def save_benchmark():
         out = {}
-        # print(inputs = request.get_json(force=True))
         if 'file' not in request.files:
             out['status'] = statusCode["FILE_MISSING"]
             return jsonify(out)
@@ -242,7 +187,8 @@ def start(config_file,
             if not os.path.exists(os.path.join(file_location['FILE_LOC'],'%s/'%language)):
                 os.makedirs(os.path.join(file_location['FILE_LOC'],'%s/'%language)) 
             file_loc =  os.path.join(file_location["FILE_LOC"], language,db_filename)
-            Benchmarks(type = file_type,language = request.form['language'],user_filename = user_filename,db_filename = db_filename,version = 0 ,created_by = "", path = file_loc).save()
+            Benchmarks(type = file_type,language = request.form['language'],user_filename = user_filename,db_filename = db_filename,version = 0 ,\
+                       created_by = "", path = file_loc).save()
 
             file.save(file_loc)
             
@@ -252,7 +198,7 @@ def start(config_file,
         except Exception as e:
             out['status'] = statusCode["SYSTEM_ERR"]
             out['status']['errObj'] = str(e)
-            logger.info("Unexpected error: %s"% sys.exc_info()[0]) 
+            logger.info("Unexpected error while saving benchmark file: %s"% sys.exc_info()[0]) 
         
         return jsonify(out)
 
@@ -297,6 +243,10 @@ def start(config_file,
             else:
                 out['status'] =  statusCode["No_File_DB"]           
             
+        except FileNotFoundError as e:
+            out['status'] = statusCode["No_File_DB"]
+            out['status']['errObj'] = str(e)
+            logger.error("File exist in database but not found on server")
         except Exception as e:
             out['status'] = statusCode["SYSTEM_ERR"]
             out['status']['errObj'] = str(e)
@@ -338,67 +288,6 @@ def start(config_file,
             out['status']['errObj'] = str(e)
             logger.info("Unexpected error: %s"% sys.exc_info()[0])
         return jsonify(out)
-
-    @app.route("/download-src", methods=['GET'])
-    def get_file():
-        """Download a file."""
-        out = {}
-        type = request.args.get('type')
-        print(type)
-        if  not type:
-            out['status'] = statusCode["TYPE_MISSING"]
-            return jsonify(out)
-        if type not in ['Gen','LC','GoI','TB']:
-            out['status'] = statusCode["INVALID_TYPE"]
-            return jsonify(out)  
-
-        try:
-            logger.info("downloading the src %s.txt file" % type)
-            return send_file(os.path.join(API_FILE_DIRECTORY,'source_files/', '%s.txt' % type), as_attachment=True)
-        except:
-            out['status'] = statusCode["SYSTEM_ERR"]
-            logger.info("Unexpected error: %s"% sys.exc_info()[0])
-            return jsonify(out) 
-
-    @app.route("/upload-tgt", methods=["POST"])
-    def post_file():
-        """Upload a file."""
-        print(request.files)
-        out = {}
-        if 'file' not in request.files:
-            out['status'] = statusCode["FILE_MISSING"]
-            return jsonify(out)
-        print(request.form)    
-        if 'type' not in request.form:
-            out['status'] = statusCode["TYPE_MISSING"]
-            return jsonify(out)  
-        if request.form['type'] not in ['Gen','LC','GoI','TB']:
-            out['status'] = statusCode["INVALID_TYPE"]
-            return jsonify(out)  
-
-        try:
-            file = request.files['file']
-            tgt_file_loc = os.path.join(API_FILE_DIRECTORY,'target_files/', '%s.txt' % request.form['type'])
-            tgt_ref_file_loc = os.path.join(API_FILE_DIRECTORY,'target_ref_files/', '%s.txt' % request.form['type'])
-            file.save(tgt_file_loc)
-
-            if os.path.exists("bleu_out.txt"):
-               os.remove("bleu_out.txt")
-            
-            os.system("perl ./tools/multi-bleu-detok.perl ./%s < ./%s > bleu-detok.txt" %(tgt_ref_file_loc,tgt_file_loc))
-            os.system("python ./tools/calculatebleu.py ./%s ./%s" %(tgt_file_loc,tgt_ref_file_loc))            
-            os.remove(tgt_file_loc)
-            logger.info("Bleu calculated and file removed")
-            with open("bleu-detok.txt") as zh:
-                out['status'] = statusCode["SUCCESS"]
-                out['response_body'] = {'bleu_for_uploaded_file':float(', '.join(zh.readlines())),
-                                        'openNMT_custom':bleu_results.OpenNMT_Custom, 'google_api': bleu_results.GOOGLE_API 
-                                        }
-        except:
-            out['status'] = statusCode["SYSTEM_ERR"]
-            logger.info("Unexpected error: %s"% sys.exc_info()[0])
-        
-        return jsonify(out)    
 
     @app.route('/to_cpu/<int:model_id>', methods=['GET'])
     def to_cpu(model_id):
