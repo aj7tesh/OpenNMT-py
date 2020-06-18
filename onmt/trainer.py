@@ -9,8 +9,6 @@
           users of this library) for the strategy things we do.
 """
 
-from copy import deepcopy
-import itertools
 import torch
 
 import onmt.utils
@@ -44,6 +42,8 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
     n_gpu = opt.world_size
     average_decay = opt.average_decay
     average_every = opt.average_every
+    dropout = opt.dropout
+    dropout_steps = opt.dropout_steps
     if device_id >= 0:
         gpu_rank = opt.gpu_ranks[device_id]
     else:
@@ -51,15 +51,42 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
         n_gpu = 0
     gpu_verbose_level = opt.gpu_verbose_level
 
-    report_manager = onmt.utils.build_report_manager(opt)
+    earlystopper = onmt.utils.EarlyStopping(
+        opt.early_stopping, scorers=onmt.utils.scorers_from_opts(opt)) \
+        if opt.early_stopping > 0 else None
+
+    source_noise = None
+    if len(opt.src_noise) > 0:
+        src_field = dict(fields)["src"].base_field
+        corpus_id_field = dict(fields).get("corpus_id", None)
+        if corpus_id_field is not None:
+            ids_to_noise = corpus_id_field.numericalize(opt.data_to_noise)
+        else:
+            ids_to_noise = None
+        source_noise = onmt.modules.source_noise.MultiNoise(
+            opt.src_noise,
+            opt.src_noise_prob,
+            ids_to_noise=ids_to_noise,
+            pad_idx=src_field.pad_token,
+            end_of_sentence_mask=src_field.end_of_sentence_mask,
+            word_start_mask=src_field.word_start_mask,
+            device_id=device_id
+        )
+
+    report_manager = onmt.utils.build_report_manager(opt, gpu_rank)
     trainer = onmt.Trainer(model, train_loss, valid_loss, optim, trunc_size,
                            shard_size, norm_method,
                            grad_accum_count, n_gpu, gpu_rank,
                            gpu_verbose_level, report_manager,
+                           with_align=True if opt.lambda_align > 0 else False,
                            model_saver=model_saver if gpu_rank == 0 else None,
                            average_decay=average_decay,
                            average_every=average_every,
-                           model_dtype=opt.model_dtype)
+                           model_dtype=opt.model_dtype,
+                           earlystopper=earlystopper,
+                           dropout=dropout,
+                           dropout_steps=dropout_steps,
+                           source_noise=source_noise)
     return trainer
 
 
@@ -90,9 +117,13 @@ class Trainer(object):
 
     def __init__(self, model, train_loss, valid_loss, optim,
                  trunc_size=0, shard_size=32,
-                 norm_method="sents", grad_accum_count=1, n_gpu=1, gpu_rank=1,
-                 gpu_verbose_level=0, report_manager=None, model_saver=None,
-                 average_decay=0, average_every=1, model_dtype='fp32'):
+                 norm_method="sents", accum_count=[1],
+                 accum_steps=[0],
+                 n_gpu=1, gpu_rank=1, gpu_verbose_level=0,
+                 report_manager=None, with_align=False, model_saver=None,
+                 average_decay=0, average_every=1, model_dtype='fp32',
+                 earlystopper=None, dropout=[0.3], dropout_steps=[0],
+                 source_noise=None):
         # Basic attributes.
         self.model = model
         self.train_loss = train_loss
@@ -106,11 +137,16 @@ class Trainer(object):
         self.gpu_rank = gpu_rank
         self.gpu_verbose_level = gpu_verbose_level
         self.report_manager = report_manager
+        self.with_align = with_align
         self.model_saver = model_saver
         self.average_decay = average_decay
         self.moving_average = None
         self.average_every = average_every
         self.model_dtype = model_dtype
+        self.earlystopper = earlystopper
+        self.dropout = dropout
+        self.dropout_steps = dropout_steps
+        self.source_noise = source_noise
 
         assert grad_accum_count > 0
         if grad_accum_count > 1:
@@ -120,6 +156,19 @@ class Trainer(object):
 
         # Set model in training mode.
         self.model.train()
+
+    def _accum_count(self, step):
+        for i in range(len(self.accum_steps)):
+            if step > self.accum_steps[i]:
+                _accum = self.accum_count_l[i]
+        return _accum
+
+    def _maybe_update_dropout(self, step):
+        for i in range(len(self.dropout_steps)):
+            if step > 1 and step == self.dropout_steps[i] + 1:
+                self.model.update_dropout(self.dropout[i])
+                logger.info("Updated dropout to %f from step %d"
+                            % (self.dropout[i], step))
 
     def _accum_batches(self, iterator):
         batches = []
@@ -184,13 +233,11 @@ class Trainer(object):
         report_stats = onmt.utils.Statistics()
         self._start_report_manager(start_time=total_stats.start_time)
 
-        if self.n_gpu > 1:
-            train_iter = itertools.islice(
-                train_iter, self.gpu_rank, None, self.n_gpu)
-
         for i, (batches, normalization) in enumerate(
                 self._accum_batches(train_iter)):
             step = self.optim.training_step
+            # UPDATE DROPOUT
+            self._maybe_update_dropout(step)
 
             if self.gpu_verbose_level > 1:
                 logger.info("GpuRank %d: index: %d", self.gpu_rank, i)
@@ -250,14 +297,16 @@ class Trainer(object):
         Returns:
             :obj:`nmt.Statistics`: validation loss statistics
         """
+        valid_model = self.model
         if moving_average:
-            valid_model = deepcopy(self.model)
+            # swap model params w/ moving average
+            # (and keep the original parameters)
+            model_params_data = []
             for avg, param in zip(self.moving_average,
                                   valid_model.parameters()):
-                param.data = avg.data.half() if self.model_dtype == "fp16" \
+                model_params_data.append(param.data)
+                param.data = avg.data.half() if self.optim._fp16 == "legacy" \
                     else avg.data
-        else:
-            valid_model = self.model
 
         # Set model in validating mode.
         valid_model.eval()
@@ -271,19 +320,21 @@ class Trainer(object):
                 tgt = batch.tgt
 
                 # F-prop through the model.
-                outputs, attns = valid_model(src, tgt, src_lengths)
+                outputs, attns = valid_model(src, tgt, src_lengths,
+                                             with_align=self.with_align)
 
                 # Compute loss.
                 _, batch_stats = self.valid_loss(batch, outputs, attns)
 
                 # Update statistics.
                 stats.update(batch_stats)
-
         if moving_average:
-            del valid_model
-        else:
-            # Set model back to training mode.
-            valid_model.train()
+            for param_data, param in zip(model_params_data,
+                                         self.model.parameters()):
+                param.data = param_data
+
+        # Set model back to training mode.
+        valid_model.train()
 
         return stats
 
@@ -300,6 +351,8 @@ class Trainer(object):
             else:
                 trunc_size = target_size
 
+            batch = self.maybe_noise_source(batch)
+
             src, src_lengths = batch.src if isinstance(batch.src, tuple) \
                 else (batch.src, None)
             if src_lengths is not None:
@@ -315,7 +368,9 @@ class Trainer(object):
                 # 2. F-prop all but generator.
                 if self.grad_accum_count == 1:
                     self.optim.zero_grad()
-                outputs, attns = self.model(src, tgt, src_lengths, bptt=bptt)
+
+                outputs, attns = self.model(src, tgt, src_lengths, bptt=bptt,
+                                            with_align=self.with_align)
                 bptt = True
 
                 # 3. Compute loss.
@@ -409,3 +464,8 @@ class Trainer(object):
             return self.report_manager.report_step(
                 learning_rate, step, train_stats=train_stats,
                 valid_stats=valid_stats)
+
+    def maybe_noise_source(self, batch):
+        if self.source_noise is not None:
+            return self.source_noise(batch)
+        return batch

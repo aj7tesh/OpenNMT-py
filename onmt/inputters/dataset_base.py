@@ -50,6 +50,7 @@ def _dynamic_dict(example, src_field, tgt_field):
     # Map source tokens to indices in the dynamic dict.
     src_map = torch.LongTensor([src_ex_vocab.stoi[w] for w in src])
     example["src_map"] = src_map
+    example["src_ex_vocab"] = src_ex_vocab
 
     if "tgt" in example:
         tgt = tgt_field.tokenize(example["tgt"])
@@ -107,7 +108,7 @@ class Dataset(TorchtextDataset):
     """
 
     def __init__(self, fields, readers, data, dirs, sort_key,
-                 filter_pred=None):
+                 filter_pred=None, corpus_id=None):
         self.sort_key = sort_key
         can_copy = 'src_map' in fields and 'alignment' in fields
 
@@ -118,6 +119,10 @@ class Dataset(TorchtextDataset):
         self.src_vocabs = []
         examples = []
         for ex_dict in starmap(_join_dicts, zip(*read_iters)):
+            if corpus_id is not None:
+                ex_dict["corpus_id"] = corpus_id
+            else:
+                ex_dict["corpus_id"] = "train"
             if can_copy:
                 src_field = fields['src']
                 tgt_field = fields['tgt']
@@ -151,3 +156,13 @@ class Dataset(TorchtextDataset):
         if remove_fields:
             self.fields = []
         torch.save(self, path)
+
+    @staticmethod
+    def config(fields):
+        readers, data, dirs = [], [], []
+        for name, field in fields:
+            if field["data"] is not None:
+                readers.append(field["reader"])
+                data.append((name, field["data"]))
+                dirs.append(field["dir"])
+        return readers, data, dirs
